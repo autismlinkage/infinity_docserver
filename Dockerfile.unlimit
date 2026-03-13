@@ -1,0 +1,85 @@
+# ONLYOFFICE DS — 解除 20 连接限制
+# 思路：C++ (x2t) 用镜像编译好的，JS 从源码跑，改一行常量
+#
+# 不编译 C++，只做：
+#   1. 从官方镜像提取 x2t、web-apps、sdkjs、fonts、nginx 配置
+#   2. 装 Node.js，从 GitHub 拉 server 源码
+#   3. 改 constants.js：LICENSE_CONNECTIONS = 20 → 自定义值
+#   4. npm install 依赖
+#   5. 用 node 直接跑 server.js（替代 pkg 编译的二进制）
+#
+# 已解决的坑：
+#   - buildVersion 必须改成 8.3.3 匹配 web-apps（否则 "Editor updated" 错误）
+#   - socket.io 必须降级到 4.5.3 匹配 web-apps 客户端（否则 "Transport unknown"）
+#   - FileConverter 缺 ms 模块（npm install ms）
+#   - nginx secure_link_secret 必须和 storage.fs.secretString 一致
+#     （否则 Editor.bin 下载 403 → "Download failed"）
+#   - nginx 不能有 duplicate listen 指令
+
+FROM onlyoffice/documentserver:8.3
+
+# 连接数上限（改这里！）
+ARG MAX_CONNECTIONS=100
+
+# 1. 安装 Node.js 18（docservice 源码需要）
+RUN apt-get update && \
+    apt-get install -y curl git && \
+    curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# 2. 克隆 server 源码（基于 fork 的 v8.3.0.18-unlimit 分支）
+RUN git clone --depth=1 --branch v8.3.0.18-unlimit https://github.com/autismlinkage/infinity_docserver.git /opt/server-src
+
+# 3. ⭐ 改连接数限制 + 版本号匹配 web-apps
+RUN sed -i "s/exports.LICENSE_CONNECTIONS = 20;/exports.LICENSE_CONNECTIONS = ${MAX_CONNECTIONS};/" \
+    /opt/server-src/Common/sources/constants.js && \
+    sed -i "s/const buildVersion = '4.1.2';/const buildVersion = '8.3.3';/" \
+    /opt/server-src/Common/sources/commondefines.js && \
+    echo "LICENSE_CONNECTIONS set to ${MAX_CONNECTIONS}" && \
+    grep LICENSE_CONNECTIONS /opt/server-src/Common/sources/constants.js
+
+# 4. 安装 npm 依赖
+#    - FileConverter 需要额外装 ms 模块
+#    - DocService socket.io 必须降级到 4.5.3 匹配 web-apps 客户端版本
+RUN cd /opt/server-src/Common && npm ci --production && \
+    cd /opt/server-src/DocService && npm ci --production && npm install socket.io@4.5.3 && \
+    cd /opt/server-src/FileConverter && npm ci --production && npm install ms
+
+# 5. 把 x2t 二进制链接到 server 源码目录（converter 需要）
+#    x2t 和相关 .so 库在原始镜像的 FileConverter/bin/ 目录
+RUN ln -sf /var/www/onlyoffice/documentserver/server/FileConverter/bin \
+           /opt/server-src/FileConverter/bin
+
+# 5.5 用源码的 config 替换镜像的旧 config（源码可能有新增配置项）
+RUN cp /opt/server-src/Common/config/default.json /etc/onlyoffice/documentserver/default.json
+
+# 6. 修改 supervisor 配置：用 node 跑源码替代编译的二进制
+COPY supervisor-docservice.conf /etc/supervisor/conf.d/ds-docservice.conf
+COPY supervisor-converter.conf /etc/supervisor/conf.d/ds-converter.conf
+
+# 7. 确保 ds 用户有权限（含 example 文件存储目录）
+RUN chown -R ds:ds /opt/server-src && \
+    chmod 755 /var/www/onlyoffice/documentserver-example/ && \
+    mkdir -p /var/lib/onlyoffice/documentserver-example/files && \
+    chown -R ds:ds /var/lib/onlyoffice/documentserver-example
+
+# 8. 修复 nginx：去掉 duplicate listen，添加 8088 端口监听
+#    同时去掉默认的 secure_link_secret（由启动脚本统一设置）
+RUN sed -i '/listen 0.0.0.0:80;/a\  listen 0.0.0.0:8088;' /etc/nginx/conf.d/ds.conf && \
+    echo "nginx: added listen 8088"
+
+# 9. 添加启动钩子：同步 nginx secure_link_secret 和 docservice storage secret
+#    容器 entrypoint 会生成随机 secret 写入 local.json 和 nginx，但替换 default.json 后
+#    可能导致两边不一致。此脚本在 supervisor 启动前同步。
+COPY sync-secrets.sh /app/ds/sync-secrets.sh
+RUN chmod +x /app/ds/sync-secrets.sh
+
+# 10.（可选）删除 Excel/PPT 编辑器节省空间
+RUN rm -rf \
+    /var/www/onlyoffice/documentserver/web-apps/apps/spreadsheeteditor \
+    /var/www/onlyoffice/documentserver/web-apps/apps/presentationeditor \
+    /var/www/onlyoffice/documentserver/web-apps/apps/pdfeditor
+
+EXPOSE 80 8088
+
