@@ -12,7 +12,9 @@
 
 set -e
 
-NGINX_CONF="/etc/nginx/conf.d/ds.conf"
+# Entrypoint uses /etc/onlyoffice/documentserver/nginx/ds.conf (same inode as conf.d/ds.conf when symlinked)
+NGINX_CONF="/etc/onlyoffice/documentserver/nginx/ds.conf"
+[ -f "$NGINX_CONF" ] || NGINX_CONF="/etc/nginx/conf.d/ds.conf"
 LOCAL_CONF="/etc/onlyoffice/documentserver/local.json"
 
 echo "[sync-secrets] Syncing nginx secure_link_secret with docservice storage secret..."
@@ -60,12 +62,24 @@ if [ -z "$SECRET" ]; then
     fi
 fi
 
-# 写入 nginx ds.conf
-if grep -q 'secure_link_secret' "$NGINX_CONF"; then
-    sed -i "s|set \$secure_link_secret.*|set \$secure_link_secret ${SECRET};|" "$NGINX_CONF"
-    echo "[sync-secrets] Updated nginx secure_link_secret"
-else
-    echo "[sync-secrets] WARNING: secure_link_secret not found in nginx config"
+# 写入 nginx ds.conf（entrypoint 使用 /etc/onlyoffice/documentserver/nginx/ds.conf，可能与 conf.d 同源或不同）
+update_nginx_secret() {
+    local f="$1"
+    [ -f "$f" ] || return 0
+    if grep -q 'secure_link_secret' "$f"; then
+        sed -i "s|set \$secure_link_secret.*|set \$secure_link_secret ${SECRET};|" "$f"
+        echo "[sync-secrets] Updated nginx secure_link_secret in $f"
+        return 0
+    fi
+    return 1
+}
+
+# Update both possible nginx config paths (nginx often includes conf.d/ds.conf, entrypoint uses onlyoffice path)
+updated=0
+update_nginx_secret "$NGINX_CONF" && updated=1
+if [ -f "/etc/nginx/conf.d/ds.conf" ] && [ "/etc/nginx/conf.d/ds.conf" != "$NGINX_CONF" ]; then
+    update_nginx_secret "/etc/nginx/conf.d/ds.conf" && updated=1
 fi
+[ "$updated" -eq 0 ] && echo "[sync-secrets] WARNING: secure_link_secret not found in nginx config"
 
 echo "[sync-secrets] Secret synced: ${SECRET:0:4}...${SECRET: -4}"

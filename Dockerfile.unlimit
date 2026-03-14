@@ -73,7 +73,9 @@ RUN sed -i '/listen 0.0.0.0:80;/a\  listen 0.0.0.0:8088;' /etc/nginx/conf.d/ds.c
 #    容器 entrypoint 会生成随机 secret 写入 local.json 和 nginx，但替换 default.json 后
 #    可能导致两边不一致。此脚本在 supervisor 启动前同步。
 COPY sync-secrets.sh /app/ds/sync-secrets.sh
-RUN chmod +x /app/ds/sync-secrets.sh
+RUN chmod +x /app/ds/sync-secrets.sh && \
+    sed -i '/service supervisor start/i /app/ds/sync-secrets.sh || true' /app/ds/run-document-server.sh && \
+    grep -q sync-secrets /app/ds/run-document-server.sh && echo "entrypoint patched: sync-secrets.sh will run before supervisor"
 
 # 10.（可选）删除 Excel/PPT 编辑器节省空间
 RUN rm -rf \
